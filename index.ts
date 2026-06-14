@@ -1,256 +1,216 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.38.4'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-};
-
-const PAYPAL_API_URL = Deno.env.get('PAYPAL_MODE') === 'live' 
-  ? 'https://api-m.paypal.com' 
-  : 'https://api-m.sandbox.paypal.com';
-
-async function getPayPalAccessToken(): Promise<string> {
-  const clientId = Deno.env.get('PAYPAL_CLIENT_ID');
-  const clientSecret = Deno.env.get('PAYPAL_CLIENT_SECRET');
-
-  if (!clientId || !clientSecret) {
-    throw new Error('PayPal credentials not configured');
-  }
-
-  const auth = btoa(`${clientId}:${clientSecret}`);
-  
-  const response = await fetch(`${PAYPAL_API_URL}/v1/oauth2/token`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Basic ${auth}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: 'grant_type=client_credentials',
-  });
-
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Failed to get PayPal access token: ${error}`);
-  }
-
-  const data = await response.json();
-  return data.access_token;
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version',
 }
 
-async function createOrder(accessToken: string, amount: number, currency: string, description: string, returnUrl?: string, cancelUrl?: string) {
-  const orderBody: any = {
-    intent: 'CAPTURE',
-    purchase_units: [{
-      amount: {
-        currency_code: currency,
-        value: amount.toFixed(2),
-      },
-      description,
-    }],
+interface ServiceWithProvider {
+  id: string;
+  title: string;
+  description: string;
+  price: number;
+  category: string;
+  provider_id: string;
+  photo_url?: string;
+  photo_urls?: string[];
+  profiles?: {
+    full_name: string;
+    avatar_url?: string;
+    city?: string;
+    state?: string;
+    average_rating?: number;
+    total_reviews?: number;
+    total_services_completed?: number;
+    latitude?: number;
+    longitude?: number;
   };
-
-  if (returnUrl) {
-    orderBody.application_context = {
-      return_url: returnUrl,
-      cancel_url: cancelUrl || returnUrl,
-      user_action: 'PAY_NOW',
-    };
-  }
-
-  const response = await fetch(`${PAYPAL_API_URL}/v2/checkout/orders`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(orderBody),
-  });
-
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Failed to create PayPal order: ${error}`);
-  }
-
-  return await response.json();
+  distance_mi?: number;
+  recommendation_score?: number;
+  recommendation_reason?: string;
 }
 
-async function captureOrder(accessToken: string, orderId: string) {
-  const response = await fetch(`${PAYPAL_API_URL}/v2/checkout/orders/${orderId}/capture`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-    },
-  });
-
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Failed to capture PayPal order: ${error}`);
-  }
-
-  return await response.json();
+function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 3959;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLon/2) * Math.sin(dLon/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c;
 }
 
-serve(async (req) => {
+function calculateCategorySimilarity(userCategories: string[], serviceCategory: string): number {
+  if (userCategories.includes(serviceCategory)) return 1.0;
+  const categoryGroups = [
+    ['Home Improvement', 'Home Maintenance', 'Specialized Niches'],
+    ['Technology & IT', 'AI Automation Services', 'Software Development'],
+    ['Health & Wellness', 'Beauty & Grooming', 'Physical Therapy'],
+    ['Marketing & Advertising', 'Content Creation', 'Visual Design'],
+    ['Corporate & Administrative', 'Financial & Legal', 'Business Consulting']
+  ];
+  for (const group of categoryGroups) {
+    if (group.some(cat => userCategories.some(userCat => userCat.includes(cat))) && 
+        group.some(cat => serviceCategory.includes(cat))) {
+      return 0.6;
+    }
+  }
+  return 0.1;
+}
+
+Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
   }
 
   try {
-    const { action, booking_id, currency = 'USD', description, order_id, return_url, cancel_url, payment_type } = await req.json();
-
-    // Require authentication for all actions
+    // Validate JWT manually
     const authHeader = req.headers.get('Authorization');
-    if (!authHeader) {
-      return new Response(JSON.stringify({ success: false, error: 'Unauthorized' }), {
-        status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    if (!authHeader?.startsWith('Bearer ')) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), { 
+        status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const anonKey = Deno.env.get('SUPABASE_ANON_KEY')!;
-    const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const userClient = createClient(supabaseUrl, anonKey, {
-      global: { headers: { Authorization: authHeader } },
-    });
-    const { data: userData, error: userErr } = await userClient.auth.getUser();
-    if (userErr || !userData?.user) {
-      return new Response(JSON.stringify({ success: false, error: 'Unauthorized' }), {
-        status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-    }
-    const adminClient = createClient(supabaseUrl, serviceKey);
 
-    // Resolve caller's profile id
-    const { data: callerProfile } = await adminClient
+    const supabaseClient = createClient(
+      Deno.env.get('SUPABASE_URL') ?? '',
+      Deno.env.get('SUPABASE_ANON_KEY') ?? '',
+      { global: { headers: { Authorization: authHeader } } }
+    );
+
+    const token = authHeader.replace('Bearer ', '');
+    const { data: claimsData, error: claimsError } = await supabaseClient.auth.getUser(token);
+    if (claimsError || !claimsData?.user) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), { 
+        status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    const user = claimsData.user;
+
+    // Get user's profile
+    const { data: profileData, error: profileError } = await supabaseClient
       .from('profiles')
-      .select('id')
-      .eq('user_id', userData.user.id)
+      .select('id, latitude, longitude, city, state, zip_code')
+      .eq('user_id', user.id)
       .single();
-    if (!callerProfile) {
-      return new Response(JSON.stringify({ success: false, error: 'Profile not found' }), {
-        status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+
+    if (profileError || !profileData) {
+      return new Response(JSON.stringify({ error: 'Profile not found' }), { 
+        status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
 
-    // Helper: load and authorize booking; return server-trusted amount
-    async function loadAuthorizedBooking(bid: string) {
-      const { data: booking, error } = await adminClient
-        .from('bookings')
-        .select('id, customer_id, booking_fee, service_price, total_price')
-        .eq('id', bid)
-        .single();
-      if (error || !booking) return { error: 'Booking not found', status: 404 } as const;
-      if (booking.customer_id !== callerProfile.id) {
-        return { error: 'Forbidden', status: 403 } as const;
-      }
-      return { booking } as const;
-    }
+    const userProfile = profileData;
 
-    const accessToken = await getPayPalAccessToken();
+    // Get booking history
+    const { data: bookingsData } = await supabaseClient
+      .from('bookings')
+      .select('service_id, status, services!inner(category)')
+      .eq('customer_id', userProfile.id)
+      .eq('status', 'completed');
 
-    if (action === 'create-order') {
-      if (!booking_id || !description) {
-        throw new Error('booking_id and description are required');
-      }
-      const result = await loadAuthorizedBooking(booking_id);
-      if ('error' in result) {
-        return new Response(JSON.stringify({ success: false, error: result.error }), {
-          status: result.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        });
-      }
-      const b = result.booking;
-      const amount = payment_type === 'service_payment'
-        ? Number(b.service_price ?? b.total_price ?? 0)
-        : Number(b.booking_fee ?? 0);
-      if (!amount || amount <= 0) {
-        throw new Error('Invalid booking amount');
-      }
+    const userBookings = bookingsData || [];
+    const userCategories = [...new Set(userBookings.map((b: any) => b.services?.category).filter(Boolean))];
 
-      const order = await createOrder(accessToken, amount, currency, description, return_url, cancel_url);
-      
-      return new Response(JSON.stringify({
-        success: true,
-        order_id: order.id,
-        approval_url: order.links.find((link: any) => link.rel === 'approve')?.href,
-      }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    // Get available services
+    const { data: services, error: servicesError } = await supabaseClient
+      .from('services')
+      .select(`
+        id, title, description, price, category, provider_id, photo_url, photo_urls,
+        profiles!inner(full_name, avatar_url, city, state, average_rating, total_reviews, total_services_completed)
+      `)
+      .eq('status', 'available')
+      .neq('provider_id', userProfile.id)
+      .limit(50);
+
+    if (servicesError) {
+      return new Response(JSON.stringify({ error: 'Failed to fetch services' }), { 
+        status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
 
-    if (action === 'capture-order') {
-      if (!order_id) {
-        throw new Error('Order ID is required');
-      }
-      // If booking_id provided, verify caller owns the booking BEFORE capturing
-      if (booking_id) {
-        const result = await loadAuthorizedBooking(booking_id);
-        if ('error' in result) {
-          return new Response(JSON.stringify({ success: false, error: result.error }), {
-            status: result.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-          });
+    // Fetch provider service areas for visible providers
+    const providerIds = [...new Set((services || []).map((s: any) => s.provider_id))];
+    const { data: areasData } = await supabaseClient
+      .from('public_provider_service_areas')
+      .select('provider_id, area_type, zip_code, city, state, latitude, longitude, radius_miles, is_active')
+      .in('provider_id', providerIds);
+
+    const areasByProvider = new Map<string, any[]>();
+    ((areasData as any[]) || []).forEach((a: any) => {
+      const list = areasByProvider.get(a.provider_id) || [];
+      list.push(a);
+      areasByProvider.set(a.provider_id, list);
+    });
+
+    const norm = (s: any) => (s ? String(s).trim().toLowerCase() : '');
+    const providerServesCustomer = (providerId: string): boolean => {
+      const areas = (areasByProvider.get(providerId) || []).filter((a: any) => a.is_active);
+      if (areas.length === 0) return true;
+      for (const a of areas) {
+        if (a.area_type === 'radius' && userProfile.latitude != null && userProfile.longitude != null && a.latitude != null && a.longitude != null && a.radius_miles != null) {
+          const d = calculateDistance(userProfile.latitude, userProfile.longitude, a.latitude, a.longitude);
+          if (d <= Number(a.radius_miles) + 1) return true;
+        } else if (a.area_type === 'zip') {
+          if (norm(a.zip_code) && norm(a.zip_code) === norm((userProfile as any).zip_code)) return true;
+        } else if (a.area_type === 'region') {
+          if (norm(a.city) && norm(a.city) === norm(userProfile.city)) return true;
+          if (!norm(a.city) && norm(a.state) && norm(a.state) === norm(userProfile.state)) return true;
         }
       }
+      return false;
+    };
 
-      const capture = await captureOrder(accessToken, order_id);
-      
-      // If booking_id provided, update the booking based on payment_type
-      if (booking_id && capture.status === 'COMPLETED') {
-        const supabase = adminClient;
+    // Calculate recommendation scores
+    const recommendations: ServiceWithProvider[] = (services || [])
+      .filter((service: any) => providerServesCustomer(service.provider_id))
+      .map((service: any) => {
+        let score = 0;
+        let reasons: string[] = [];
+        
+        const categorySimilarity = calculateCategorySimilarity(userCategories, service.category || '');
+        score += categorySimilarity * 0.4;
+        if (categorySimilarity === 1.0) reasons.push('Previously booked similar service');
+        else if (categorySimilarity > 0.5) reasons.push('Related to your interests');
+        
+        let distance = 0;
+        // Note: provider lat/lng no longer included in join for security
+        // Distance scoring disabled to avoid exposing precise GPS
+        
+        const rating = service.profiles?.average_rating || 0;
+        score += (rating / 5) * 0.2;
+        if (rating >= 4.5) reasons.push('Highly rated provider');
+        else if (rating >= 4.0) reasons.push('Well-rated provider');
+        
+        const completedServices = service.profiles?.total_services_completed || 0;
+        score += Math.min(completedServices / 50, 1) * 0.1;
+        if (completedServices >= 20) reasons.push('Experienced provider');
+        
+        return {
+          ...service,
+          distance_mi: distance,
+          recommendation_score: score,
+          recommendation_reason: reasons.join(' • ')
+        };
+      })
+      .filter((s: any) => s.recommendation_score > 0.2)
+      .sort((a: any, b: any) => (b.recommendation_score || 0) - (a.recommendation_score || 0))
+      .slice(0, 8);
 
-        if (payment_type === 'booking_fee') {
-          await supabase
-            .from('bookings')
-            .update({ 
-              booking_fee_status: 'paid',
-              status: 'confirmed',
-              notes: `Booking Fee PayPal Payment ID: ${capture.id}`
-            })
-            .eq('id', booking_id)
-            .eq('customer_id', callerProfile.id);
-        } else if (payment_type === 'service_payment') {
-          await supabase
-            .from('bookings')
-            .update({ 
-              service_payment_status: 'paid',
-              notes: `Service Payment PayPal ID: ${capture.id}`
-            })
-            .eq('id', booking_id)
-            .eq('customer_id', callerProfile.id);
-        } else {
-          // Legacy: update status to confirmed
-          await supabase
-            .from('bookings')
-            .update({ 
-              status: 'confirmed',
-              notes: `PayPal Payment ID: ${capture.id}`
-            })
-            .eq('id', booking_id)
-            .eq('customer_id', callerProfile.id);
-        }
-      }
-
-      return new Response(JSON.stringify({
-        success: true,
-        capture_id: capture.id,
-        status: capture.status,
-        payer: capture.payer,
-        payment_type,
-      }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-    }
-
-    throw new Error('Invalid action. Use "create-order" or "capture-order"');
+    return new Response(JSON.stringify({
+      recommendations,
+      user_categories: userCategories,
+      total_bookings: userBookings.length
+    }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
 
   } catch (error) {
-    console.error('PayPal checkout error:', error);
-    return new Response(JSON.stringify({
-      success: false,
-      error: error.message,
-    }), {
-      status: 400,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    console.error('Recommendations error:', error);
+    return new Response(JSON.stringify({ error: 'Internal server error' }), { 
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   }
 });
