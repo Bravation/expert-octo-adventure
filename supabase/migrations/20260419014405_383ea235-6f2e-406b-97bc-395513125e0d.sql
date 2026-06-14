@@ -1,0 +1,1 @@
+DELETE FROM public.services WHERE id = '2dd59391-ee35-4a08-b291-261f36169388' AND title = '__TEST_NEW_BADGE__';
