@@ -1,105 +1,256 @@
-import { type StripeEnv, verifyWebhook } from "../_shared/stripe.ts";
-import { createClient } from "npm:@supabase/supabase-js@2";
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-let _supabase: ReturnType<typeof createClient> | null = null;
-function getSupabase() {
-  if (!_supabase) {
-    _supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-    );
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+};
+
+const PAYPAL_API_URL = Deno.env.get('PAYPAL_MODE') === 'live' 
+  ? 'https://api-m.paypal.com' 
+  : 'https://api-m.sandbox.paypal.com';
+
+async function getPayPalAccessToken(): Promise<string> {
+  const clientId = Deno.env.get('PAYPAL_CLIENT_ID');
+  const clientSecret = Deno.env.get('PAYPAL_CLIENT_SECRET');
+
+  if (!clientId || !clientSecret) {
+    throw new Error('PayPal credentials not configured');
   }
-  return _supabase;
+
+  const auth = btoa(`${clientId}:${clientSecret}`);
+  
+  const response = await fetch(`${PAYPAL_API_URL}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: 'grant_type=client_credentials',
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Failed to get PayPal access token: ${error}`);
+  }
+
+  const data = await response.json();
+  return data.access_token;
 }
 
-// Stripe webhooks are server-to-server; no CORS / browser preflight needed.
-Deno.serve(async (req) => {
-  if (req.method !== "POST") {
-    return new Response("Method not allowed", { status: 405 });
+async function createOrder(accessToken: string, amount: number, currency: string, description: string, returnUrl?: string, cancelUrl?: string) {
+  const orderBody: any = {
+    intent: 'CAPTURE',
+    purchase_units: [{
+      amount: {
+        currency_code: currency,
+        value: amount.toFixed(2),
+      },
+      description,
+    }],
+  };
+
+  if (returnUrl) {
+    orderBody.application_context = {
+      return_url: returnUrl,
+      cancel_url: cancelUrl || returnUrl,
+      user_action: 'PAY_NOW',
+    };
   }
 
-  const rawEnv = new URL(req.url).searchParams.get("env");
-  if (rawEnv !== "sandbox" && rawEnv !== "live") {
-    console.error("Webhook received with invalid or missing env query parameter:", rawEnv);
-    return new Response(
-      JSON.stringify({ received: true, ignored: "invalid env" }),
-      { status: 200, headers: { "Content-Type": "application/json" } },
-    );
-  }
-  const env: StripeEnv = rawEnv;
+  const response = await fetch(`${PAYPAL_API_URL}/v2/checkout/orders`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(orderBody),
+  });
 
-  let event: { type: string; data: { object: any }; id: string };
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Failed to create PayPal order: ${error}`);
+  }
+
+  return await response.json();
+}
+
+async function captureOrder(accessToken: string, orderId: string) {
+  const response = await fetch(`${PAYPAL_API_URL}/v2/checkout/orders/${orderId}/capture`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Failed to capture PayPal order: ${error}`);
+  }
+
+  return await response.json();
+}
+
+serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders });
+  }
+
   try {
-    event = await verifyWebhook(req, env);
-  } catch (e) {
-    console.error("Signature verification failed:", e);
-    return new Response("Invalid signature", { status: 400 });
-  }
+    const { action, booking_id, currency = 'USD', description, order_id, return_url, cancel_url, payment_type } = await req.json();
 
-  try {
-    console.log(`[my-endpoint] received ${event.type} (${event.id}) env=${env}`);
-    const obj = event.data.object;
+    // Require authentication for all actions
+    const authHeader = req.headers.get('Authorization');
+    if (!authHeader) {
+      return new Response(JSON.stringify({ success: false, error: 'Unauthorized' }), {
+        status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+    const anonKey = Deno.env.get('SUPABASE_ANON_KEY')!;
+    const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+    const userClient = createClient(supabaseUrl, anonKey, {
+      global: { headers: { Authorization: authHeader } },
+    });
+    const { data: userData, error: userErr } = await userClient.auth.getUser();
+    if (userErr || !userData?.user) {
+      return new Response(JSON.stringify({ success: false, error: 'Unauthorized' }), {
+        status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const adminClient = createClient(supabaseUrl, serviceKey);
 
-    switch (event.type) {
-      case "checkout.session.completed": {
-        const bookingId = obj.metadata?.booking_id;
-        if (bookingId) {
-          await getSupabase().from("bookings").update({
-            service_payment_status: "paid",
-            booking_fee_status: "paid",
-            stripe_payment_intent_id: obj.payment_intent ?? null,
-            stripe_checkout_session_id: obj.id,
-          }).eq("id", bookingId);
-          console.log("Booking marked paid via checkout.session.completed:", bookingId);
-        }
-        break;
-      }
-      case "payment_intent.succeeded": {
-        const bookingId = obj.metadata?.booking_id;
-        if (bookingId) {
-          await getSupabase().from("bookings").update({
-            service_payment_status: "paid",
-            booking_fee_status: "paid",
-            stripe_payment_intent_id: obj.id,
-          }).eq("id", bookingId);
-        }
-        break;
-      }
-      case "payment_intent.payment_failed": {
-        const bookingId = obj.metadata?.booking_id;
-        if (bookingId) {
-          await getSupabase().from("bookings").update({
-            service_payment_status: "failed",
-          }).eq("id", bookingId);
-        }
-        console.log("PaymentIntent failed:", obj.id, obj.last_payment_error?.message);
-        break;
-      }
-      case "customer.subscription.created":
-      case "customer.subscription.updated":
-      case "customer.subscription.deleted":
-        console.log("Subscription event:", event.type, obj.id, "status:", obj.status);
-        break;
-      case "account.updated": {
-        await getSupabase().from("connect_accounts").update({
-          charges_enabled: !!obj.charges_enabled,
-          payouts_enabled: !!obj.payouts_enabled,
-          details_submitted: !!obj.details_submitted,
-          requirements: obj.requirements ?? {},
-        }).eq("stripe_account_id", obj.id);
-        break;
-      }
-      default:
-        console.log("Unhandled event:", event.type);
+    // Resolve caller's profile id
+    const { data: callerProfile } = await adminClient
+      .from('profiles')
+      .select('id')
+      .eq('user_id', userData.user.id)
+      .single();
+    if (!callerProfile) {
+      return new Response(JSON.stringify({ success: false, error: 'Profile not found' }), {
+        status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
     }
 
-    return new Response(
-      JSON.stringify({ received: true }),
-      { status: 200, headers: { "Content-Type": "application/json" } },
-    );
-  } catch (e) {
-    console.error("my-endpoint handler error:", e);
-    // Return 500 so Stripe retries.
-    return new Response("Webhook handler error", { status: 500 });
+    // Helper: load and authorize booking; return server-trusted amount
+    async function loadAuthorizedBooking(bid: string) {
+      const { data: booking, error } = await adminClient
+        .from('bookings')
+        .select('id, customer_id, booking_fee, service_price, total_price')
+        .eq('id', bid)
+        .single();
+      if (error || !booking) return { error: 'Booking not found', status: 404 } as const;
+      if (booking.customer_id !== callerProfile.id) {
+        return { error: 'Forbidden', status: 403 } as const;
+      }
+      return { booking } as const;
+    }
+
+    const accessToken = await getPayPalAccessToken();
+
+    if (action === 'create-order') {
+      if (!booking_id || !description) {
+        throw new Error('booking_id and description are required');
+      }
+      const result = await loadAuthorizedBooking(booking_id);
+      if ('error' in result) {
+        return new Response(JSON.stringify({ success: false, error: result.error }), {
+          status: result.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+      const b = result.booking;
+      const amount = payment_type === 'service_payment'
+        ? Number(b.service_price ?? b.total_price ?? 0)
+        : Number(b.booking_fee ?? 0);
+      if (!amount || amount <= 0) {
+        throw new Error('Invalid booking amount');
+      }
+
+      const order = await createOrder(accessToken, amount, currency, description, return_url, cancel_url);
+      
+      return new Response(JSON.stringify({
+        success: true,
+        order_id: order.id,
+        approval_url: order.links.find((link: any) => link.rel === 'approve')?.href,
+      }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (action === 'capture-order') {
+      if (!order_id) {
+        throw new Error('Order ID is required');
+      }
+      // If booking_id provided, verify caller owns the booking BEFORE capturing
+      if (booking_id) {
+        const result = await loadAuthorizedBooking(booking_id);
+        if ('error' in result) {
+          return new Response(JSON.stringify({ success: false, error: result.error }), {
+            status: result.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      const capture = await captureOrder(accessToken, order_id);
+      
+      // If booking_id provided, update the booking based on payment_type
+      if (booking_id && capture.status === 'COMPLETED') {
+        const supabase = adminClient;
+
+        if (payment_type === 'booking_fee') {
+          await supabase
+            .from('bookings')
+            .update({ 
+              booking_fee_status: 'paid',
+              status: 'confirmed',
+              notes: `Booking Fee PayPal Payment ID: ${capture.id}`
+            })
+            .eq('id', booking_id)
+            .eq('customer_id', callerProfile.id);
+        } else if (payment_type === 'service_payment') {
+          await supabase
+            .from('bookings')
+            .update({ 
+              service_payment_status: 'paid',
+              notes: `Service Payment PayPal ID: ${capture.id}`
+            })
+            .eq('id', booking_id)
+            .eq('customer_id', callerProfile.id);
+        } else {
+          // Legacy: update status to confirmed
+          await supabase
+            .from('bookings')
+            .update({ 
+              status: 'confirmed',
+              notes: `PayPal Payment ID: ${capture.id}`
+            })
+            .eq('id', booking_id)
+            .eq('customer_id', callerProfile.id);
+        }
+      }
+
+      return new Response(JSON.stringify({
+        success: true,
+        capture_id: capture.id,
+        status: capture.status,
+        payer: capture.payer,
+        payment_type,
+      }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    throw new Error('Invalid action. Use "create-order" or "capture-order"');
+
+  } catch (error) {
+    console.error('PayPal checkout error:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message,
+    }), {
+      status: 400,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
   }
 });
