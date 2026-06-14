@@ -1,0 +1,1 @@
+DELETE FROM public.notifications WHERE user_id = 'a6259152-d0ff-48f9-8de1-9da69eaf023e' AND type = 'milestone';

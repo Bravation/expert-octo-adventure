@@ -1,0 +1,2 @@
+UPDATE services SET photo_url = 'https://images.unsplash.com/photo-1558618666-fcd25c85f82e?w=600&fit=crop', photo_urls = ARRAY['https://images.unsplash.com/photo-1558618666-fcd25c85f82e?w=600&fit=crop'] WHERE title = 'Emissions Testing';
+UPDATE services SET photo_url = 'https://images.unsplash.com/photo-1492144534655-ae79c964c9d7?w=600&fit=crop', photo_urls = ARRAY['https://images.unsplash.com/photo-1492144534655-ae79c964c9d7?w=600&fit=crop'] WHERE title = 'Emissions Testing';
