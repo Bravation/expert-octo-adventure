@@ -1,0 +1,33 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`bbox query operator URL snapshots (regression guard for gt/gte/lt/lte mapping) > lat=gt+lt, lon=gt+lt produces stable PostgREST operator URL 1`] = `"latitude=gt.12.3456&latitude=lt.12.3456&longitude=gt.-65.4321&longitude=lt.-65.4321&select=user_id,email,latitude,longitude"`;
+
+exports[`bbox query operator URL snapshots (regression guard for gt/gte/lt/lte mapping) > lat=gt+lt, lon=gt+lte produces stable PostgREST operator URL 1`] = `"latitude=gt.12.3456&latitude=lt.12.3456&longitude=gt.-65.4321&longitude=lte.-65.4321&select=user_id,email,latitude,longitude"`;
+
+exports[`bbox query operator URL snapshots (regression guard for gt/gte/lt/lte mapping) > lat=gt+lt, lon=gte+lt produces stable PostgREST operator URL 1`] = `"latitude=gt.12.3456&latitude=lt.12.3456&longitude=gte.-65.4321&longitude=lt.-65.4321&select=user_id,email,latitude,longitude"`;
+
+exports[`bbox query operator URL snapshots (regression guard for gt/gte/lt/lte mapping) > lat=gt+lt, lon=gte+lte produces stable PostgREST operator URL 1`] = `"latitude=gt.12.3456&latitude=lt.12.3456&longitude=gte.-65.4321&longitude=lte.-65.4321&select=user_id,email,latitude,longitude"`;
+
+exports[`bbox query operator URL snapshots (regression guard for gt/gte/lt/lte mapping) > lat=gt+lte, lon=gt+lt produces stable PostgREST operator URL 1`] = `"latitude=gt.12.3456&latitude=lte.12.3456&longitude=gt.-65.4321&longitude=lt.-65.4321&select=user_id,email,latitude,longitude"`;
+
+exports[`bbox query operator URL snapshots (regression guard for gt/gte/lt/lte mapping) > lat=gt+lte, lon=gt+lte produces stable PostgREST operator URL 1`] = `"latitude=gt.12.3456&latitude=lte.12.3456&longitude=gt.-65.4321&longitude=lte.-65.4321&select=user_id,email,latitude,longitude"`;
+
+exports[`bbox query operator URL snapshots (regression guard for gt/gte/lt/lte mapping) > lat=gt+lte, lon=gte+lt produces stable PostgREST operator URL 1`] = `"latitude=gt.12.3456&latitude=lte.12.3456&longitude=gte.-65.4321&longitude=lt.-65.4321&select=user_id,email,latitude,longitude"`;
+
+exports[`bbox query operator URL snapshots (regression guard for gt/gte/lt/lte mapping) > lat=gt+lte, lon=gte+lte produces stable PostgREST operator URL 1`] = `"latitude=gt.12.3456&latitude=lte.12.3456&longitude=gte.-65.4321&longitude=lte.-65.4321&select=user_id,email,latitude,longitude"`;
+
+exports[`bbox query operator URL snapshots (regression guard for gt/gte/lt/lte mapping) > lat=gte+lt, lon=gt+lt produces stable PostgREST operator URL 1`] = `"latitude=gte.12.3456&latitude=lt.12.3456&longitude=gt.-65.4321&longitude=lt.-65.4321&select=user_id,email,latitude,longitude"`;
+
+exports[`bbox query operator URL snapshots (regression guard for gt/gte/lt/lte mapping) > lat=gte+lt, lon=gt+lte produces stable PostgREST operator URL 1`] = `"latitude=gte.12.3456&latitude=lt.12.3456&longitude=gt.-65.4321&longitude=lte.-65.4321&select=user_id,email,latitude,longitude"`;
+
+exports[`bbox query operator URL snapshots (regression guard for gt/gte/lt/lte mapping) > lat=gte+lt, lon=gte+lt produces stable PostgREST operator URL 1`] = `"latitude=gte.12.3456&latitude=lt.12.3456&longitude=gte.-65.4321&longitude=lt.-65.4321&select=user_id,email,latitude,longitude"`;
+
+exports[`bbox query operator URL snapshots (regression guard for gt/gte/lt/lte mapping) > lat=gte+lt, lon=gte+lte produces stable PostgREST operator URL 1`] = `"latitude=gte.12.3456&latitude=lt.12.3456&longitude=gte.-65.4321&longitude=lte.-65.4321&select=user_id,email,latitude,longitude"`;
+
+exports[`bbox query operator URL snapshots (regression guard for gt/gte/lt/lte mapping) > lat=gte+lte, lon=gt+lt produces stable PostgREST operator URL 1`] = `"latitude=gte.12.3456&latitude=lte.12.3456&longitude=gt.-65.4321&longitude=lt.-65.4321&select=user_id,email,latitude,longitude"`;
+
+exports[`bbox query operator URL snapshots (regression guard for gt/gte/lt/lte mapping) > lat=gte+lte, lon=gt+lte produces stable PostgREST operator URL 1`] = `"latitude=gte.12.3456&latitude=lte.12.3456&longitude=gt.-65.4321&longitude=lte.-65.4321&select=user_id,email,latitude,longitude"`;
+
+exports[`bbox query operator URL snapshots (regression guard for gt/gte/lt/lte mapping) > lat=gte+lte, lon=gte+lt produces stable PostgREST operator URL 1`] = `"latitude=gte.12.3456&latitude=lte.12.3456&longitude=gte.-65.4321&longitude=lt.-65.4321&select=user_id,email,latitude,longitude"`;
+
+exports[`bbox query operator URL snapshots (regression guard for gt/gte/lt/lte mapping) > lat=gte+lte, lon=gte+lte produces stable PostgREST operator URL 1`] = `"latitude=gte.12.3456&latitude=lte.12.3456&longitude=gte.-65.4321&longitude=lte.-65.4321&select=user_id,email,latitude,longitude"`;
