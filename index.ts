@@ -1,5 +1,4 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -7,138 +6,136 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
+// Simple in-memory rate limiter (per IP, resets on cold start)
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+const RATE_LIMIT_MAX = 15; // max requests per window
+
+function isRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return false;
+  }
+  entry.count++;
+  return entry.count > RATE_LIMIT_MAX;
+}
+
+// Input validation
+const MAX_MESSAGE_LENGTH = 2000;
+const MAX_MESSAGES = 50;
+
+function validateMessages(messages: unknown): { valid: boolean; error?: string } {
+  if (!Array.isArray(messages)) return { valid: false, error: "messages must be an array" };
+  if (messages.length === 0) return { valid: false, error: "messages cannot be empty" };
+  if (messages.length > MAX_MESSAGES) return { valid: false, error: `Too many messages (max ${MAX_MESSAGES})` };
+
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") return { valid: false, error: "Invalid message format" };
+    if (!["user", "assistant"].includes(msg.role)) return { valid: false, error: "Invalid message role" };
+    if (typeof msg.content !== "string") return { valid: false, error: "Message content must be a string" };
+    if (msg.content.length > MAX_MESSAGE_LENGTH) return { valid: false, error: `Message too long (max ${MAX_MESSAGE_LENGTH} chars)` };
+    if (msg.content.trim().length === 0) return { valid: false, error: "Message cannot be empty" };
+  }
+  return { valid: true };
+}
+
+const SYSTEM_PROMPT = `You are ServiHub's friendly AI support assistant. You help users navigate the ServiHub platform — a marketplace connecting customers with local service providers across Florida.
+
+Your capabilities:
+- Explain how ServiHub works (browsing services, booking, requesting quotes)
+- Help customers find the right service category
+- Explain the commission structure for providers (starts at 10%, drops with milestones)
+- Guide users through signup, login, and dashboard features
+- Answer general questions about service categories available on the platform
+- Provide support in both English and Spanish — respond in the language the user writes in
+
+Keep answers concise, helpful, and friendly. Use markdown formatting when helpful. If you don't know something specific about a user's account, suggest they check their dashboard or contact a human support agent.
+
+IMPORTANT: You are ONLY a ServiHub support assistant. Do not answer questions unrelated to ServiHub, services marketplaces, or general platform help. Politely decline off-topic requests.`;
+
 serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: corsHeaders });
+  }
 
   try {
-    const authHeader = req.headers.get("Authorization");
-    if (!authHeader) throw new Error("Missing authorization");
+    // Rate limiting by IP
+    const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+    if (isRateLimited(ip)) {
+      return new Response(
+        JSON.stringify({ error: "Too many requests. Please wait a moment and try again." }),
+        { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
 
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_ANON_KEY")!,
-      { global: { headers: { Authorization: authHeader } } }
-    );
+    const body = await req.json();
+    const { messages } = body;
 
-    const { data: { user }, error: authError } = await supabase.auth.getUser();
-    if (authError || !user) throw new Error("Unauthorized");
-
-    const { subject, message } = await req.json();
-    if (!subject || !message) throw new Error("Subject and message are required");
+    // Validate input
+    const validation = validateMessages(messages);
+    if (!validation.valid) {
+      return new Response(
+        JSON.stringify({ error: validation.error }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
 
     const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
     if (!LOVABLE_API_KEY) throw new Error("LOVABLE_API_KEY is not configured");
 
-    // Call AI to analyze the feedback
-    const aiResponse = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${LOVABLE_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "google/gemini-3-flash-preview",
-        messages: [
-          {
-            role: "system",
-            content: `You are a customer support AI for a service marketplace platform. Analyze the user's feedback/suggestion and respond with a helpful, empathetic acknowledgment. You must also categorize the feedback and detect the sentiment.
-
-Your response must call the analyze_feedback function with the results.`
-          },
-          {
-            role: "user",
-            content: `Subject: ${subject}\n\nMessage: ${message}`,
-          },
-        ],
-        tools: [
-          {
-            type: "function",
-            function: {
-              name: "analyze_feedback",
-              description: "Analyze and respond to user feedback",
-              parameters: {
-                type: "object",
-                properties: {
-                  category: {
-                    type: "string",
-                    enum: ["bug_report", "feature_request", "complaint", "praise", "question", "general"],
-                    description: "Category of the feedback"
-                  },
-                  sentiment: {
-                    type: "string",
-                    enum: ["positive", "neutral", "negative"],
-                    description: "Sentiment of the feedback"
-                  },
-                  response: {
-                    type: "string",
-                    description: "A helpful, empathetic response to the user (2-4 sentences)"
-                  }
-                },
-                required: ["category", "sentiment", "response"],
-                additionalProperties: false
-              }
-            }
-          }
-        ],
-        tool_choice: { type: "function", function: { name: "analyze_feedback" } },
-      }),
-    });
-
-    if (!aiResponse.ok) {
-      if (aiResponse.status === 429) {
-        return new Response(JSON.stringify({ error: "Rate limit exceeded. Please try again later." }), {
-          status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
+    const response = await fetch(
+      "https://ai.gateway.lovable.dev/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${LOVABLE_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "google/gemini-3-flash-preview",
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            ...messages.map((m: { role: string; content: string }) => ({
+              role: m.role,
+              content: m.content.slice(0, MAX_MESSAGE_LENGTH),
+            })),
+          ],
+          stream: true,
+        }),
       }
-      if (aiResponse.status === 402) {
-        return new Response(JSON.stringify({ error: "AI service quota exceeded." }), {
-          status: 402, headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
+    );
+
+    if (!response.ok) {
+      if (response.status === 429) {
+        return new Response(
+          JSON.stringify({ error: "Rate limit exceeded. Please try again shortly." }),
+          { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
       }
-      throw new Error("AI analysis failed");
+      if (response.status === 402) {
+        return new Response(
+          JSON.stringify({ error: "AI credits exhausted. Please try again later." }),
+          { status: 402, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      const t = await response.text();
+      console.error("AI gateway error:", response.status, t);
+      return new Response(
+        JSON.stringify({ error: "AI service unavailable" }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
     }
 
-    const aiData = await aiResponse.json();
-    const toolCall = aiData.choices?.[0]?.message?.tool_calls?.[0];
-    
-    let category = "general";
-    let sentiment = "neutral";
-    let aiReply = "Thank you for your feedback! We've received your suggestion and will review it carefully.";
-
-    if (toolCall?.function?.arguments) {
-      try {
-        const parsed = JSON.parse(toolCall.function.arguments);
-        category = parsed.category || category;
-        sentiment = parsed.sentiment || sentiment;
-        aiReply = parsed.response || aiReply;
-      } catch { /* use defaults */ }
-    }
-
-    // Save to database
-    const { data, error } = await supabase
-      .from("suggestions")
-      .insert({
-        user_id: user.id,
-        subject,
-        message,
-        category,
-        sentiment,
-        ai_response: aiReply,
-        status: "reviewed",
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    return new Response(JSON.stringify({ suggestion: data, ai_response: aiReply, category, sentiment }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    return new Response(response.body, {
+      headers: { ...corsHeaders, "Content-Type": "text/event-stream" },
     });
   } catch (e) {
-    console.error("analyze-suggestion error:", e);
-    return new Response(JSON.stringify({ error: e instanceof Error ? e.message : "Unknown error" }), {
-      status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    console.error("chat error:", e);
+    return new Response(
+      JSON.stringify({ error: e instanceof Error ? e.message : "Unknown error" }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
   }
 });
