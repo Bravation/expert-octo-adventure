@@ -1,0 +1,5 @@
+UPDATE public.customer_milestones 
+SET positive_reviews = 0, 
+    current_booking_fee_percentage = 10.00,
+    updated_at = now()
+WHERE customer_id = 'e016e3e1-20d4-47ec-b58a-169f3c910881';
