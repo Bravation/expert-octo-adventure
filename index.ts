@@ -1,5 +1,6 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { type StripeEnv, createStripeClient } from "../_shared/stripe.ts";
+import { computeAmounts } from "../_shared/fees.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -28,46 +29,99 @@ Deno.serve(async (req) => {
     }
     const userId = claims.claims.sub;
 
-    const body = await req.json().catch(() => ({}));
+    const body = await req.json();
+    const bookingId = body?.booking_id as string;
     const env: StripeEnv = body?.env === "live" ? "live" : "sandbox";
+    const origin = req.headers.get("origin") || body?.origin || "https://example.com";
+    if (!bookingId) {
+      return new Response(JSON.stringify({ error: "booking_id required" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
 
     const admin = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
     );
-    const { data: profile } = await admin.from("profiles").select("id").eq("user_id", userId).single();
-    if (!profile) {
-      return new Response(JSON.stringify({ connected: false }), { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+
+    // Load booking and verify caller is the customer
+    const { data: booking, error: bErr } = await admin
+      .from("bookings")
+      .select("id, customer_id, provider_id, service_id, service_price, services(title)")
+      .eq("id", bookingId)
+      .single();
+    if (bErr || !booking) {
+      return new Response(JSON.stringify({ error: "Booking not found" }), { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
-    const { data: row } = await admin
+    const { data: callerProfile } = await admin.from("profiles").select("id, email").eq("user_id", userId).single();
+    if (!callerProfile || callerProfile.id !== booking.customer_id) {
+      return new Response(JSON.stringify({ error: "Forbidden" }), { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    // Provider Connect account
+    const { data: connect } = await admin
       .from("connect_accounts")
-      .select("*")
-      .eq("provider_id", profile.id)
+      .select("stripe_account_id, charges_enabled")
+      .eq("provider_id", booking.provider_id)
       .eq("environment", env)
       .maybeSingle();
-
-    if (!row) {
-      return new Response(JSON.stringify({ connected: false }), { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    if (!connect?.stripe_account_id || !connect.charges_enabled) {
+      return new Response(JSON.stringify({ error: "Provider is not ready to accept Stripe payments" }), { status: 409, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
+    // Look up provider's current commission rate from milestone tier (15% → 5%, step every 20 completed bookings)
+    const { data: milestone } = await admin
+      .from("provider_milestones")
+      .select("current_commission_rate")
+      .eq("provider_id", booking.provider_id)
+      .maybeSingle();
+    const commissionRatePct = Number(milestone?.current_commission_rate ?? 15);
+
+    const amounts = computeAmounts(Number(booking.service_price), commissionRatePct);
     const stripe = createStripeClient(env);
-    const account = await stripe.accounts.retrieve(row.stripe_account_id);
 
-    const updated = {
-      charges_enabled: !!account.charges_enabled,
-      payouts_enabled: !!account.payouts_enabled,
-      details_submitted: !!account.details_submitted,
-      requirements: (account.requirements ?? {}) as any,
-    };
-    await admin.from("connect_accounts").update(updated).eq("id", row.id);
+    const serviceTitle = (booking as any).services?.title || "Service";
 
-    return new Response(JSON.stringify({ connected: true, ...updated, stripe_account_id: row.stripe_account_id }), {
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer_email: callerProfile.email || undefined,
+      line_items: [{
+        quantity: 1,
+        price_data: {
+          currency: "usd",
+          unit_amount: amounts.customerChargeCents,
+          product_data: { name: serviceTitle },
+        },
+      }],
+      payment_intent_data: {
+        application_fee_amount: amounts.applicationFeeCents,
+        transfer_data: { destination: connect.stripe_account_id },
+        metadata: { booking_id: bookingId },
+      },
+      metadata: { booking_id: bookingId },
+      success_url: `${origin}/booking-payment-return?booking_id=${bookingId}&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${origin}/booking-payment-return?booking_id=${bookingId}&cancelled=1`,
+    });
+
+    await admin.from("bookings").update({
+      payment_provider: "stripe",
+      stripe_checkout_session_id: session.id,
+      customer_total_charged: amounts.customerCharge,
+      provider_net_amount: amounts.providerNet,
+      platform_fee_amount: amounts.platformNet,
+      stripe_fee_amount: amounts.stripeFee,
+      application_fee_amount: amounts.applicationFee,
+      commission_rate: amounts.commissionRatePct,
+      commission_amount: amounts.platformNet,
+      connect_account_id: connect.stripe_account_id,
+      total_price: amounts.customerCharge,
+    }).eq("id", bookingId);
+
+    return new Response(JSON.stringify({ url: session.url, amounts }), {
       status: 200,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (e) {
-    console.error("stripe-connect-status error", e);
+    console.error("stripe-create-booking-checkout error", e);
     return new Response(JSON.stringify({ error: (e as Error).message }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
   }
 });
